@@ -27,7 +27,10 @@
         <button class="nav-item" data-page="live"><i data-lucide="radio-tower"></i><span>Live Studio</span><span class="nav-dot"></span></button>
         <button class="nav-item" data-page="video-clipper">
   <i data-lucide="scissors"></i>
-  <span>Video Clipper</span>
+  <span>Video Clipper</span><button class="nav-item" data-page="ai-highlights">
+  <i data-lucide="sparkles"></i>
+  <span>AI Highlights</span>
+</button>
 </button>
         <button class="nav-item" data-page="clips"><i data-lucide="film"></i><span>My Clips</span><span class="nav-count" id="navClipCount">3</span></button>
         <button class="nav-item" data-page="editor"><i data-lucide="scissors"></i><span>Clip Editor</span></button>
@@ -170,6 +173,67 @@
   </section>
 </section>
 <!-- End Video Clipper -->
+
+<!-- AI Highlight Detection -->
+<section class="page" id="page-ai-highlights">
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">AI-POWERED VIDEO ANALYSIS</p>
+      <h1>AI Highlights<span class="accent-dot">.</span></h1>
+      <p class="subheading">
+        Automatically find potentially exciting moments and create clips from your videos.
+      </p>
+    </div>
+  </div>
+
+  <section class="panel">
+    <div class="panel-heading">
+      <div>
+        <h2>Find Your Highlights</h2>
+        <p>Analyze audio intensity and generate clips automatically.</p>
+      </div>
+      <span class="stat-icon purple">
+        <i data-lucide="sparkles"></i>
+      </span>
+    </div>
+
+    <form id="aiHighlightsForm">
+      <div class="form-group">
+        <label for="aiHighlightsVideo">Choose your video</label>
+        <input
+          type="file"
+          id="aiHighlightsVideo"
+          name="video"
+          accept="video/*"
+          required
+        >
+        <small class="fine-print">
+          Maximum upload size: 500 MB.
+        </small>
+      </div>
+
+      <button
+        type="submit"
+        class="button button-primary"
+        id="findHighlightsButton"
+      >
+        <i data-lucide="sparkles"></i>
+        Find Highlights
+      </button>
+
+      <p id="aiHighlightsStatus" class="fine-print" role="status">
+        Upload a video to get started.
+      </p>
+
+      <div id="aiHighlightsResults" hidden>
+        <h3>Your Generated Clips</h3>
+        <div id="aiHighlightsList"></div>
+      </div>
+    </form>
+  </section>
+</section>
+<!-- End AI Highlight Detection -->
+
         <section class="page" id="page-live">
           <div class="page-heading"><div><p class="eyebrow">YOUR STREAM, IN REAL TIME</p><h1>Live Studio<span class="accent-dot">.</span></h1><p class="subheading">Connect Twitch and keep an eye out for your next great moment.</p></div><span class="connection-badge" id="connectionBadge"><span class="status-dot gray"></span> Not connected</span></div>
           <div class="live-layout">

@@ -252,3 +252,99 @@ if (videoClipForm) {
     }
   });
 }
+// AI Highlight Detection
+const aiHighlightsForm = document.getElementById("aiHighlightsForm");
+
+if (aiHighlightsForm) {
+  aiHighlightsForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+
+    const videoInput = document.getElementById("aiHighlightsVideo");
+    const status = document.getElementById("aiHighlightsStatus");
+    const results = document.getElementById("aiHighlightsResults");
+    const list = document.getElementById("aiHighlightsList");
+    const button = document.getElementById("findHighlightsButton");
+
+    const video = videoInput.files[0];
+
+    if (!video) {
+      status.textContent = "Please choose a video file.";
+      return;
+    }
+
+    if (video.size > 500 * 1024 * 1024) {
+      status.textContent = "Your video exceeds the 500 MB limit.";
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append("video", video);
+
+    button.disabled = true;
+    status.textContent =
+      "Analyzing audio and generating highlights. Please wait...";
+
+    results.hidden = true;
+    list.replaceChildren();
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/clips/highlights`,
+        {
+          method: "POST",
+          body: formData
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail || `Request failed: ${response.status}`
+        );
+      }
+
+      data.highlights.forEach((highlight, index) => {
+        const card = document.createElement("div");
+        card.className = "panel";
+        card.style.marginTop = "16px";
+
+        const title = document.createElement("h3");
+        title.textContent = `Highlight ${index + 1}`;
+
+        const timestamps = document.createElement("p");
+        timestamps.textContent =
+          `${highlight.start_seconds}s – ${highlight.end_seconds}s`;
+
+        const download = document.createElement("a");
+        download.className = "button button-secondary";
+        download.href = `${API_BASE_URL}${highlight.download_url}`;
+        download.textContent = "Download Clip";
+        download.download = `highlight_${index + 1}.mp4`;
+
+        card.append(title, timestamps, download);
+        list.appendChild(card);
+      });
+
+      results.hidden = false;
+
+      status.textContent =
+        `Success! ${data.clips_created} highlight clip(s) created.`;
+
+      if (typeof syncBackendStatus === "function") {
+        syncBackendStatus();
+      }
+
+      console.log("AI Highlights created successfully:", data);
+
+    } catch (error) {
+      status.textContent =
+        `Could not detect highlights: ${error.message}`;
+
+      console.error("AI Highlight Detection failed:", error);
+
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
