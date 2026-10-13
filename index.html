@@ -16,12 +16,19 @@
     <aside class="sidebar" id="sidebar">
       <a  href="#" class="brand">
         <img src="logo.svg" /></span>
-        <span><strong>ClipStream</strong><small>AI CREATOR STUDIO</small></span>
+        <span>
+          <strong>ClipStream</strong>
+          <small>AI CREATOR STUDIO</small>
+        </span>
       </a>
       <div class="workspace-label">WORKSPACE</div>
       <nav class="nav-menu" aria-label="Main navigation">
         <button class="nav-item active" data-page="overview"><i data-lucide="layout-dashboard"></i><span>Overview</span></button>
         <button class="nav-item" data-page="live"><i data-lucide="radio-tower"></i><span>Live Studio</span><span class="nav-dot"></span></button>
+        <button class="nav-item" data-page="video-clipper">
+  <i data-lucide="scissors"></i>
+  <span>Video Clipper</span>
+</button>
         <button class="nav-item" data-page="clips"><i data-lucide="film"></i><span>My Clips</span><span class="nav-count" id="navClipCount">3</span></button>
         <button class="nav-item" data-page="editor"><i data-lucide="scissors"></i><span>Clip Editor</span></button>
         <button class="nav-item" data-page="publishing"><i data-lucide="send"></i><span>Publishing</span></button>
@@ -63,7 +70,8 @@
             <div class="hero-content"><div class="live-label"><span class="pulse"></span> YOUR NEXT GREAT MOMENT STARTS HERE</div><h2>Stay in the moment.<br><span>We'll find the clips.</span></h2><p>Connect a Twitch channel and let ClipStream help you spot memorable moments while you stream.</p><button class="button button-light" data-page="live">Connect your stream <i data-lucide="arrow-up-right"></i></button></div>
             <div class="hero-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="hero-glow"></div><div class="hero-play"><i data-lucide="play"></i></div><div class="floating-chip chip-one"><i data-lucide="audio-lines"></i> Great reaction</div><div class="floating-chip chip-two"><i data-lucide="captions"></i> Captions ready</div><div class="waveform"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div></div>
           </div>
-          <div class="section-title-row"><div><h2>At a glance</h2><p>Your recent creator activity</p></div><button class="text-button" data-page="clips">View all clips <i data-lucide="arrow-right"></i></button></div>
+          <div class="section-title-row"><div><h2>At a glance</h2><p>Your recent creator activity</p></div><button class="text-button" data-page="clips">View all clips <i data-lucide="arrow-right"></i></button></div><p id="backendApiStatus"
+          class="fine-print" role="status">checking connection to clipStream API...</p>
           <div class="stats-grid">
             <article class="stat-card"><div class="stat-top"><span>Clips generated</span><span class="stat-icon purple"><i data-lucide="clapperboard"></i></span></div><div class="stat-value" id="statClips">3</div><div class="stat-foot"><span class="status-dot violet"></span> In this demo workspace</div></article>
             <article class="stat-card"><div class="stat-top"><span>Awaiting review</span><span class="stat-icon amber"><i data-lucide="scan-eye"></i></span></div><div class="stat-value" id="statReview">2</div><div class="stat-foot">Review before publishing</div></article>
@@ -75,7 +83,93 @@
             <section class="panel quick-panel"><div class="panel-heading"><div><h2>Quick actions</h2><p>Keep your workflow moving</p></div></div><button class="quick-action" data-page="live"><span class="quick-icon purple"><i data-lucide="radio-tower"></i></span><span><strong>Open Live Studio</strong><small>Check your live connection</small></span><i data-lucide="chevron-right"></i></button><button class="quick-action" data-page="clips"><span class="quick-icon blue"><i data-lucide="film"></i></span><span><strong>Review your clips</strong><small>Approve or reject moments</small></span><i data-lucide="chevron-right"></i></button><button class="quick-action" data-page="publishing"><span class="quick-icon green"><i data-lucide="send"></i></span><span><strong>Publishing queue</strong><small>Prepare clips for social media</small></span><i data-lucide="chevron-right"></i></button><div class="tip-card"><i data-lucide="lightbulb"></i><div><strong>Creator tip</strong><p>Great short clips usually make sense without needing the full conversation. Keep enough context around the punchline.</p></div></div></section>
           </div>
         </section>
+<!-- Video Clipper -->
+<section class="page" id="page-video-clipper">
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">VIDEO PROCESSING</p>
+      <h1>Video Clipper<span class="accent-dot">.</span></h1>
+      <p class="subheading">
+        Upload a video, select your timestamps, and create a real clip.
+      </p>
+    </div>
+  </div>
 
+  <section class="panel">
+    <div class="panel-heading">
+      <div>
+        <h2>Create a video clip</h2>
+        <p>Powered by FFmpeg</p>
+      </div>
+      <span class="stat-icon purple">
+        <i data-lucide="scissors"></i>
+      </span>
+    </div>
+
+    <form id="videoClipForm">
+      <div class="form-group">
+        <label for="videoFile">Choose a video</label>
+        <input
+          type="file"
+          id="videoFile"
+          name="video"
+          accept="video/*"
+          required
+        >
+        <small class="fine-print">
+          Maximum file size: 500 MB.
+        </small>
+      </div>
+
+      <div class="form-group">
+        <label for="clipStart">Start time (seconds)</label>
+        <input
+          type="number"
+          id="clipStart"
+          name="start_seconds"
+          min="0"
+          step="0.1"
+          value="0"
+          required
+        >
+      </div>
+
+      <div class="form-group">
+        <label for="clipEnd">End time (seconds)</label>
+        <input
+          type="number"
+          id="clipEnd"
+          name="end_seconds"
+          min="0.1"
+          step="0.1"
+          value="3"
+          required
+        >
+      </div>
+
+      <button type="submit" class="button button-primary" id="createVideoClip">
+        <i data-lucide="scissors"></i>
+        Create Clip
+      </button>
+
+      <p id="videoClipStatus" class="fine-print" role="status">
+        Choose a video to get started.
+      </p>
+
+      <div id="videoClipResult" hidden>
+        <a
+          id="downloadVideoClip"
+          class="button button-secondary"
+          href="#"
+          download
+        >
+          Download Clip
+        </a>
+      </div>
+    </form>
+  </section>
+</section>
+<!-- End Video Clipper -->
         <section class="page" id="page-live">
           <div class="page-heading"><div><p class="eyebrow">YOUR STREAM, IN REAL TIME</p><h1>Live Studio<span class="accent-dot">.</span></h1><p class="subheading">Connect Twitch and keep an eye out for your next great moment.</p></div><span class="connection-badge" id="connectionBadge"><span class="status-dot gray"></span> Not connected</span></div>
           <div class="live-layout">

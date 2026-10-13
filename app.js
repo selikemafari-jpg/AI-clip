@@ -124,5 +124,131 @@ $("#approvalRequired").addEventListener("change",e=>toast(e.target.checked?"Appr
 $("#defaultFormat").addEventListener("change",e=>toast("Default format set to "+e.target.value+"."));
 $("#editorFormat").addEventListener("change",e=>toast("Preview format preference updated. Actual video rendering is not connected.","crop"));
 
+const API_BASE_URL = "http://127.0.0.1:8000";
+
+async function syncBackendStatus() {
+  const statusElement = $("#backendApiStatus");
+
+  if (!statusElement) return;
+
+  statusElement.textContent = "Checking backend connection...";
+
+  try {
+    const response = await fetch(
+      `${API_BASE_URL}/api/dashboard`
+    );
+
+    if (!response.ok) {
+      throw new Error(`HTTP error: ${response.status}`);
+    }
+
+    const dashboard = await response.json();
+
+    statusElement.textContent =
+      `Backend connected | Stream: ${dashboard.stream_status} | ` +
+      `Clips ready: ${dashboard.clips_ready} | ` +
+      `Detected: ${dashboard.clips_detected} | ` +
+      `Failed: ${dashboard.clips_failed}`;
+
+    console.log("ClipStream API dashboard:", dashboard);
+
+  } catch (error) {
+    statusElement.textContent =
+      "Backend unavailable. Check that the server is running on port 8000.";
+
+    console.error("ClipStream API request failed:", error);
+  }
+}
+
 function renderAll(){renderRecent();renderClips();renderQueue();renderIcons();}
-renderAll();setLiveState(false);renderIcons();
+renderAll();
+setLiveState(false);
+renderIcons();
+syncBackendStatus();
+
+// Real video clipping with the ClipStream AI backend
+const videoClipForm = document.getElementById("videoClipForm");
+
+if (videoClipForm) {
+  videoClipForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+
+    const videoInput = document.getElementById("videoFile");
+    const startInput = document.getElementById("clipStart");
+    const endInput = document.getElementById("clipEnd");
+    const status = document.getElementById("videoClipStatus");
+    const result = document.getElementById("videoClipResult");
+    const downloadLink = document.getElementById("downloadVideoClip");
+    const submitButton = document.getElementById("createVideoClip");
+
+    const video = videoInput.files[0];
+    const start = Number(startInput.value);
+    const end = Number(endInput.value);
+
+    if (!video) {
+      status.textContent = "Please choose a video file.";
+      return;
+    }
+
+    if (video.size > 500 * 1024 * 1024) {
+      status.textContent = "Your video exceeds the 500 MB limit.";
+      return;
+    }
+
+    if (
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
+      start < 0 ||
+      end <= start ||
+      end - start > 300
+    ) {
+      status.textContent =
+        "Choose valid start and end times. Clips must be between 0 and 300 seconds long.";
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append("video", video);
+    formData.append("start_seconds", String(start));
+    formData.append("end_seconds", String(end));
+
+    submitButton.disabled = true;
+    status.textContent = "Uploading video and creating your clip...";
+    result.hidden = true;
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/clips/trim`,
+        {
+          method: "POST",
+          body: formData
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail || `Request failed with status ${response.status}`
+        );
+      }
+
+      downloadLink.href = `${API_BASE_URL}${data.download_url}`;
+      result.hidden = false;
+
+      status.textContent =
+        `Success! Your ${data.duration_seconds}-second clip is ready.`;
+
+      console.log("Clip created successfully:", data);
+
+      if (typeof syncBackendStatus === "function") {
+        syncBackendStatus();
+      }
+    } catch (error) {
+      status.textContent = `Could not create clip: ${error.message}`;
+      console.error("Video clipping failed:", error);
+    } finally {
+      submitButton.disabled = false;
+    }
+  });
+}
