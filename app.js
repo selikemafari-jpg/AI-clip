@@ -288,13 +288,10 @@ if (aiHighlightsForm) {
     list.replaceChildren();
 
     try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/clips/highlights`,
-        {
-          method: "POST",
-          body: formData
-        }
-      );
+      const response = await fetch(`${API_BASE_URL}/api/clips/highlights-v2`, {
+        method: "POST",
+        body: formData
+      });
 
       const data = await response.json();
 
