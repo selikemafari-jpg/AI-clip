@@ -241,7 +241,7 @@ $("#clipGrid").addEventListener("click", (event) => {
 
   const video = $("#editorPreviewVideo");
   const placeholder = $("#editorVideoPlaceholder");
-
+video.dataset.clipId = clip.clip_id;
   // Load the real video into the editor preview
   video.src = `${API_BASE_URL}${clip.preview_url}`;
   video.hidden = false;
@@ -601,6 +601,107 @@ if (aiHighlightsForm) {
 
     } finally {
       button.disabled = false;
+    }
+  });
+}
+// Export the selected video in the chosen aspect ratio
+const exportFormattedClipButton =
+  document.getElementById("exportFormattedClip");
+
+if (exportFormattedClipButton) {
+  exportFormattedClipButton.addEventListener("click", async () => {
+    const video = document.getElementById("editorPreviewVideo");
+    const formatSelect = document.getElementById("editorFormat");
+    const status = document.getElementById("formatClipStatus");
+    const placeholder = document.getElementById("editorVideoPlaceholder");
+
+    if (!video || !formatSelect || !status) {
+      return;
+    }
+
+    const clipId = video.dataset.clipId;
+
+    if (!clipId) {
+      status.textContent =
+        "Open a real generated video from My Clips before exporting.";
+      return;
+    }
+
+    const aspectRatio = formatSelect.value;
+
+    exportFormattedClipButton.disabled = true;
+    status.textContent =
+      `Exporting your video as ${aspectRatio}. Please wait...`;
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/clips/${encodeURIComponent(clipId)}/format`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded"
+          },
+        body: new URLSearchParams({
+  aspect_ratio: aspectRatio,
+  caption: document.getElementById("editorCaption").value
+})  
+        }
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail || `Export failed: ${response.status}`
+        );
+      }
+
+      // Preview the newly formatted video.
+      video.src = `${API_BASE_URL}${data.preview_url}`;
+      video.dataset.clipId = data.clip_id;
+      video.hidden = false;
+
+      if (placeholder) {
+        placeholder.hidden = true;
+      }
+
+      video.load();
+
+      // Create or update the download button.
+      let downloadLink =
+        document.getElementById("formattedClipDownload");
+
+      if (!downloadLink) {
+        downloadLink = document.createElement("a");
+        downloadLink.id = "formattedClipDownload";
+        downloadLink.className = "button button-secondary";
+        downloadLink.style.display = "inline-flex";
+        downloadLink.style.marginTop = "10px";
+
+        status.insertAdjacentElement("afterend", downloadLink);
+      }
+
+      downloadLink.href = `${API_BASE_URL}${data.download_url}`;
+      downloadLink.download =
+        `clip_${data.clip_id}_${aspectRatio.replace(":", "x")}.mp4`;
+      downloadLink.textContent = `Download ${aspectRatio} Video`;
+
+      // Refresh My Clips to include the new formatted file.
+      if (typeof loadGeneratedClips === "function") {
+        await loadGeneratedClips();
+      }
+
+      status.textContent =
+        `Success! Your ${aspectRatio} video is ready. The original clip is preserved.`;
+
+      console.log("Formatted video created:", data);
+
+    } catch (error) {
+      status.textContent = `Could not export video: ${error.message}`;
+      console.error("Video export failed:", error);
+
+    } finally {
+      exportFormattedClipButton.disabled = false;
     }
   });
 }

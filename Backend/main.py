@@ -1,21 +1,26 @@
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
+import math
 import shutil
 import subprocess
+import tempfile
 import uuid
-import math
-import struct
 import wave
-from faster_whisper import WhisperModel
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+
+# ============================================================
+# CLIPSTREAM AI — BACKEND CONFIGURATION
+# ============================================================
+
 app = FastAPI(
     title="ClipStream AI API",
-    description="Backend for the AI-powered streamer clipping platform",
-    version="0.2.0",
+    description="Video clipping, highlight detection, transcription and export.",
+    version="0.3.0",
 )
 
 app.add_middleware(
@@ -23,63 +28,582 @@ app.add_middleware(
     allow_origins=[
         "http://127.0.0.1:5500",
         "http://localhost:5500",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
     ],
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 CLIPS_DIR = BASE_DIR / "clips"
+TEMP_DIR = BASE_DIR / "temp"
 
-UPLOAD_DIR.mkdir(exist_ok=True)
-CLIPS_DIR.mkdir(exist_ok=True)
+for directory in (UPLOAD_DIR, CLIPS_DIR, TEMP_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
 
-MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB
-MAX_CLIP_SECONDS = 300  # 5 minutes
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+MAX_CLIP_SECONDS = 300
+MAX_GENERATED_CLIPS = 20
 
-
-def get_ffmpeg() -> str:
-    executable = shutil.which("ffmpeg")
-    if not executable:
-        raise HTTPException(
-            status_code=500,
-            detail="FFmpeg was not found. Check your PATH.",
-        )
-    return executable
-
-# Whisper speech-recognition model
 _whisper_model = None
 
 
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def get_ffmpeg() -> str:
+    """Find FFmpeg on the computer."""
+
+    ffmpeg = shutil.which("ffmpeg")
+
+    if not ffmpeg:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "FFmpeg was not found. Install FFmpeg and ensure "
+                "its bin folder is available in PATH."
+            ),
+        )
+
+    return ffmpeg
+
+
+def get_ffprobe() -> Optional[str]:
+    """Find FFprobe if it is installed."""
+
+    return shutil.which("ffprobe")
+
+
+def safe_clip_path(clip_id: str) -> Path:
+    """Return a validated path for a generated clip."""
+
+    if not clip_id.isalnum():
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid clip ID.",
+        )
+
+    path = CLIPS_DIR / f"{clip_id}.mp4"
+
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Clip not found.",
+        )
+
+    return path
+
+
+def run_command(
+    command: list[str],
+    timeout: int = 600,
+) -> subprocess.CompletedProcess:
+    """Run a command and report useful errors."""
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=408,
+            detail="The video operation timed out.",
+        )
+
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not start the video operation: {exc}",
+        )
+
+    return result
+
+
+def run_ffmpeg(
+    arguments: list[str],
+    timeout: int = 600,
+) -> None:
+    """Execute FFmpeg and raise a readable error if it fails."""
+
+    command = [get_ffmpeg(), "-hide_banner", "-y", *arguments]
+
+    result = run_command(command, timeout=timeout)
+
+    if result.returncode != 0:
+        error_message = (result.stderr or result.stdout or "").strip()
+
+        print("FFmpeg error:")
+        print(error_message[-5000:])
+
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "FFmpeg could not process this video. "
+                "Check the backend terminal for details."
+            ),
+        )
+
+
+async def save_upload(file: UploadFile) -> Path:
+    """Save an uploaded video without exceeding the size limit."""
+
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="No filename was provided.",
+        )
+
+    suffix = Path(file.filename).suffix.lower()
+
+    allowed_extensions = {
+        ".mp4",
+        ".mov",
+        ".mkv",
+        ".webm",
+        ".avi",
+        ".m4v",
+    }
+
+    if suffix not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported video format.",
+        )
+
+    destination = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
+    total_bytes = 0
+
+    try:
+        with destination.open("wb") as output:
+            while True:
+                chunk = await file.read(1024 * 1024)
+
+                if not chunk:
+                    break
+
+                total_bytes += len(chunk)
+
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="The video exceeds the 500 MB upload limit.",
+                    )
+
+                output.write(chunk)
+
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+    finally:
+        await file.close()
+
+    if total_bytes == 0:
+        destination.unlink(missing_ok=True)
+
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is empty.",
+        )
+
+    return destination
+
+
+def get_video_duration(video_path: Path) -> float:
+    """Get video duration in seconds using FFprobe."""
+
+    ffprobe = get_ffprobe()
+
+    if not ffprobe:
+        raise HTTPException(
+            status_code=500,
+            detail="FFprobe was not found. Check your FFmpeg installation.",
+        )
+
+    result = run_command(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ],
+        timeout=60,
+    )
+
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=422,
+            detail="The uploaded file could not be read as a video.",
+        )
+
+    try:
+        duration = float(result.stdout.strip())
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=422,
+            detail="Could not determine the video duration.",
+        )
+
+    if not math.isfinite(duration) or duration <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="The video has an invalid duration.",
+        )
+
+    return duration
+
+
+def validate_clip_times(
+    start_seconds: float,
+    end_seconds: float,
+    duration: float,
+) -> float:
+    """Validate a requested clip range."""
+
+    if start_seconds < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="The start time cannot be negative.",
+        )
+
+    if end_seconds <= start_seconds:
+        raise HTTPException(
+            status_code=400,
+            detail="The end time must be after the start time.",
+        )
+
+    if end_seconds > duration:
+        raise HTTPException(
+            status_code=400,
+            detail="The end time exceeds the video duration.",
+        )
+
+    clip_duration = end_seconds - start_seconds
+
+    if clip_duration > MAX_CLIP_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail="Clips cannot exceed five minutes.",
+        )
+
+    return clip_duration
+
+
+def extract_audio_wav(
+    video_path: Path,
+    wav_path: Path,
+) -> None:
+    """Extract mono, 16 kHz audio for analysis and transcription."""
+
+    run_ffmpeg(
+        [
+            "-i",
+            str(video_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(wav_path),
+        ],
+        timeout=600,
+    )
+
+    if not wav_path.is_file() or wav_path.stat().st_size == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not extract audio from this video.",
+        )
+
+
 def get_whisper_model():
+    """Load Whisper only when transcription is requested."""
+
     global _whisper_model
 
     if _whisper_model is None:
-        print("Loading Whisper Base model...")
+        try:
+            from faster_whisper import WhisperModel
 
-        _whisper_model = WhisperModel(
-            "base",
-            device="cpu",
-            compute_type="int8",
-        )
+            _whisper_model = WhisperModel(
+                "base",
+                device="cpu",
+                compute_type="int8",
+            )
 
-        print("Whisper Base model loaded!")
+        except Exception as exc:
+            print(f"Whisper initialization failed: {exc}")
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Whisper could not start. Check that "
+                    "faster-whisper is installed."
+                ),
+            )
 
     return _whisper_model
 
+
+def transcribe_audio(wav_path: Path) -> list[dict]:
+    """Transcribe extracted audio with Whisper."""
+
+    model = get_whisper_model()
+
+    try:
+        segments, info = model.transcribe(
+            str(wav_path),
+            beam_size=5,
+            vad_filter=True,
+        )
+
+        transcript = []
+
+        for segment in segments:
+            text = segment.text.strip()
+
+            if not text:
+                continue
+
+            transcript.append(
+                {
+                    "start": round(float(segment.start), 2),
+                    "end": round(float(segment.end), 2),
+                    "text": text,
+                }
+            )
+
+        return transcript
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print(f"Transcription failed: {exc}")
+
+        raise HTTPException(
+            status_code=422,
+            detail="Whisper could not transcribe this video's audio.",
+        )
+
+
+def create_clip(
+    source_path: Path,
+    start_seconds: float,
+    end_seconds: float,
+) -> tuple[str, Path]:
+    """Create a new MP4 clip from a source video."""
+
+    duration = end_seconds - start_seconds
+
+    if duration <= 0 or duration > MAX_CLIP_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid clip duration.",
+        )
+
+    clip_id = uuid.uuid4().hex
+    output_path = CLIPS_DIR / f"{clip_id}.mp4"
+
+    try:
+        run_ffmpeg(
+            [
+                "-ss",
+                str(start_seconds),
+                "-i",
+                str(source_path),
+                "-t",
+                str(duration),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ],
+            timeout=900,
+        )
+
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise HTTPException(
+                status_code=422,
+                detail="FFmpeg did not produce a valid clip.",
+            )
+
+        return clip_id, output_path
+
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
+
+
+def calculate_audio_energy(
+    wav_path: Path,
+) -> list[tuple[float, float]]:
+    """Calculate approximate one-second audio RMS energy."""
+
+    results = []
+
+    try:
+        with wave.open(str(wav_path), "rb") as audio:
+            sample_rate = audio.getframerate()
+            sample_width = audio.getsampwidth()
+            channels = audio.getnchannels()
+
+            if sample_width != 2:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Audio must be 16-bit PCM for analysis.",
+                )
+
+            frames_per_second = sample_rate
+            second_index = 0
+
+            while True:
+                raw = audio.readframes(frames_per_second)
+
+                if not raw:
+                    break
+
+                sample_count = len(raw) // 2
+
+                if sample_count == 0:
+                    second_index += 1
+                    continue
+
+                import array
+
+                samples = array.array("h")
+                samples.frombytes(raw)
+
+                # Account for multi-channel audio if encountered.
+                if channels > 1:
+                    samples = samples[::channels]
+
+                if not samples:
+                    second_index += 1
+                    continue
+
+                mean_square = sum(
+                    sample * sample for sample in samples
+                ) / len(samples)
+
+                rms = math.sqrt(mean_square)
+
+                results.append(
+                    (
+                        float(second_index),
+                        float(rms),
+                    )
+                )
+
+                second_index += 1
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print(f"Audio analysis failed: {exc}")
+
+        raise HTTPException(
+            status_code=422,
+            detail="Could not analyze this video's audio.",
+        )
+
+    return results
+
+
+def choose_loud_windows(
+    energy: list[tuple[float, float]],
+    duration: float,
+    max_clips: int = 20,
+    clip_length: int = 30,
+) -> list[tuple[float, float, float]]:
+    """Select loud, reasonably separated candidate clip windows."""
+
+    if not energy:
+        return []
+
+    candidates = []
+
+    for second, rms in energy:
+        start = max(0.0, second - clip_length / 2)
+        end = min(duration, start + clip_length)
+
+        if end - start < 5:
+            continue
+
+        candidates.append((start, end, rms))
+
+    candidates.sort(
+        key=lambda item: item[2],
+        reverse=True,
+    )
+
+    selected = []
+
+    for start, end, score in candidates:
+        overlaps = any(
+            not (
+                end <= existing_start
+                or start >= existing_end
+            )
+            for existing_start, existing_end, _ in selected
+        )
+
+        if overlaps:
+            continue
+
+        selected.append((start, end, score))
+
+        if len(selected) >= max_clips:
+            break
+
+    selected.sort(key=lambda item: item[0])
+
+    return selected
+
+
+# ============================================================
+# HEALTH AND DASHBOARD
+# ============================================================
+
 @app.get("/")
-def home():
+def root():
     return {
-        "app": "ClipStream API",
-        "message": "Your backend is running successfully!",
-        "status": "online",
+        "message": "Your ClipStream AI backend is running successfully!",
+        "version": app.version,
     }
 
 
 @app.get("/api/health")
-def health_check():
+def health():
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -88,1152 +612,635 @@ def health_check():
 
 @app.get("/api/dashboard")
 def dashboard():
+    clips = list(CLIPS_DIR.glob("*.mp4"))
+
     return {
-        "message": "Waiting for a Twitch stream connection",
-        "stream_status": "offline",
-        "clips_ready": sum(1 for p in CLIPS_DIR.glob("*.mp4")),
-        "clips_detected": 0,
-        "clips_failed": 0,
+        "status": "online",
+        "message": "ClipStream AI backend is running.",
+        "clips_ready": len(clips),
+        "detected": len(clips),
+        "failed": 0,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
+# ============================================================
+# MANUAL VIDEO TRIMMING
+# ============================================================
+
 @app.post("/api/clips/trim")
-async def trim_video(
-    video: UploadFile = File(...),
+async def trim_clip(
+    file: UploadFile = File(...),
     start_seconds: float = Form(...),
     end_seconds: float = Form(...),
 ):
-    if not video.filename:
-        raise HTTPException(status_code=400, detail="Choose a video file.")
-
-    if not video.content_type or not video.content_type.startswith("video/"):
-        raise HTTPException(
-            status_code=400,
-            detail="Upload a video file with a recognized video content type.",
-        )
-
-    if (
-        start_seconds < 0
-        or end_seconds <= start_seconds
-        or end_seconds - start_seconds > MAX_CLIP_SECONDS
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Choose valid start and end times. Clips must be 5 minutes or shorter.",
-        )
-
-    clip_id = uuid.uuid4().hex
-    input_path = UPLOAD_DIR / f"{clip_id}_source"
-    output_path = CLIPS_DIR / f"{clip_id}.mp4"
-
-    total_bytes = 0
+    source_path = await save_upload(file)
 
     try:
-        with input_path.open("wb") as destination:
-            while True:
-                chunk = await video.read(1024 * 1024)
-                if not chunk:
-                    break
+        duration = get_video_duration(source_path)
 
-                total_bytes += len(chunk)
-                if total_bytes > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail="Video exceeds the 500 MB upload limit.",
-                    )
-
-                destination.write(chunk)
-
-        if total_bytes == 0:
-            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-
-        command = [
-            get_ffmpeg(),
-            "-y",
-            "-ss", str(start_seconds),
-            "-i", str(input_path),
-            "-t", str(end_seconds - start_seconds),
-            "-map", "0:v:0",
-            "-map", "0:a?",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-c:a", "aac",
-            "-movflags", "+faststart",
-            str(output_path),
-        ]
-
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False,
+        validate_clip_times(
+            start_seconds,
+            end_seconds,
+            duration,
         )
 
-        if result.returncode != 0 or not output_path.exists():
-            raise HTTPException(
-                status_code=422,
-                detail="FFmpeg could not process this video. Try a different video file.",
-            )
+        clip_id, output_path = create_clip(
+            source_path,
+            start_seconds,
+            end_seconds,
+        )
 
         return {
-            "message": "Clip created successfully.",
+            "success": True,
             "clip_id": clip_id,
-            "duration_seconds": end_seconds - start_seconds,
+            "start_seconds": start_seconds,
+            "end_seconds": end_seconds,
+            "duration": round(end_seconds - start_seconds, 2),
             "download_url": f"/api/clips/{clip_id}/download",
+            "preview_url": f"/api/clips/{clip_id}/preview",
+            "file_size": output_path.stat().st_size,
         }
 
-    except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=408,
-            detail="Video processing took too long. Try a shorter video.",
-        )
     finally:
-        await video.close()
-        input_path.unlink(missing_ok=True)
+        source_path.unlink(missing_ok=True)
 
-# Automatic Highlight Detection
+
+# ============================================================
+# AUDIO-BASED HIGHLIGHT DETECTION
+# ============================================================
+
 @app.post("/api/clips/highlights")
-async def detect_highlights(
-    video: UploadFile = File(...)
+async def generate_highlights(
+    file: UploadFile = File(...),
+    max_clips: int = Form(10),
+    clip_length: int = Form(30),
 ):
-    if not video.filename:
-        raise HTTPException(
-            status_code=400,
-            detail="Please choose a video file."
-        )
+    max_clips = max(1, min(max_clips, MAX_GENERATED_CLIPS))
+    clip_length = max(5, min(clip_length, 90))
 
-    if not video.content_type or not video.content_type.startswith("video/"):
-        raise HTTPException(
-            status_code=400,
-            detail="Please upload a valid video file."
-        )
+    source_path = await save_upload(file)
+    wav_path = TEMP_DIR / f"{uuid.uuid4().hex}.wav"
 
-    job_id = uuid.uuid4().hex
-
-    input_path = UPLOAD_DIR / f"{job_id}_source"
-    audio_path = UPLOAD_DIR / f"{job_id}_audio.wav"
-
-    total_bytes = 0
+    created_clips = []
 
     try:
-        # Save the uploaded video
-        with input_path.open("wb") as destination:
-            while True:
-                chunk = await video.read(1024 * 1024)
+        duration = get_video_duration(source_path)
 
-                if not chunk:
-                    break
-
-                total_bytes += len(chunk)
-
-                if total_bytes > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail="Video exceeds the 500 MB upload limit."
-                    )
-
-                destination.write(chunk)
-
-        if total_bytes == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="The uploaded video is empty."
-            )
-
-        # Extract audio using FFmpeg
-        command = [
-            get_ffmpeg(),
-            "-y",
-            "-i", str(input_path),
-            "-vn",
-            "-ac", "1",
-            "-ar", "16000",
-            "-c:a", "pcm_s16le",
-            str(audio_path)
-        ]
-
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False
+        extract_audio_wav(
+            source_path,
+            wav_path,
         )
 
-        if result.returncode != 0 or not audio_path.exists():
-            raise HTTPException(
-                status_code=422,
-                detail="Could not extract audio. The video may not contain audio."
-            )
+        energy = calculate_audio_energy(wav_path)
 
-        # Analyze audio intensity
-        with wave.open(str(audio_path), "rb") as audio:
-            sample_rate = audio.getframerate()
-            sample_width = audio.getsampwidth()
-            channels = audio.getnchannels()
-            total_frames = audio.getnframes()
+        windows = choose_loud_windows(
+            energy,
+            duration,
+            max_clips=max_clips,
+            clip_length=clip_length,
+        )
 
-            if sample_width != 2:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Unsupported audio format."
+        for start, end, score in windows:
+            try:
+                clip_id, output_path = create_clip(
+                    source_path,
+                    start,
+                    end,
                 )
 
-            if total_frames == 0:
-                raise HTTPException(
-                    status_code=422,
-                    detail="The video contains no usable audio."
+                created_clips.append(
+                    {
+                        "clip_id": clip_id,
+                        "start": round(start, 2),
+                        "end": round(end, 2),
+                        "duration": round(end - start, 2),
+                        "audio_score": round(score, 2),
+                        "download_url": (
+                            f"/api/clips/{clip_id}/download"
+                        ),
+                        "preview_url": (
+                            f"/api/clips/{clip_id}/preview"
+                        ),
+                    }
                 )
 
-            duration = total_frames / sample_rate
+            except HTTPException as exc:
+                print(f"Could not create highlight: {exc.detail}")
 
-            if duration < 3:
-                raise HTTPException(
-                    status_code=422,
-                    detail="The video must be at least 3 seconds long."
-                )
+        return {
+            "success": True,
+            "method": "audio_energy",
+            "total_clips": len(created_clips),
+            "clips": created_clips,
+            "note": (
+                "Loudness helps locate possible highlights, "
+                "but does not guarantee that a moment is funny "
+                "or interesting."
+            ),
+        }
 
-            energies = []
-            frames_per_second = sample_rate
+    finally:
+        source_path.unlink(missing_ok=True)
+        wav_path.unlink(missing_ok=True)
 
-            while True:
-                raw_audio = audio.readframes(frames_per_second)
 
-                if not raw_audio:
-                    break
+# ============================================================
+# VIDEO TRANSCRIPTION
+# ============================================================
 
-                sample_count = len(raw_audio) // 2
+@app.post("/api/clips/transcribe")
+async def transcribe_video(
+    file: UploadFile = File(...),
+):
+    source_path = await save_upload(file)
+    wav_path = TEMP_DIR / f"{uuid.uuid4().hex}.wav"
 
-                if sample_count == 0:
-                    continue
+    try:
+        extract_audio_wav(
+            source_path,
+            wav_path,
+        )
 
-                samples = struct.unpack(
-                    "<" + ("h" * sample_count),
-                    raw_audio[:sample_count * 2]
-                )
+        transcript = transcribe_audio(wav_path)
 
-                squared_total = sum(
-                    sample * sample for sample in samples
-                )
+        return {
+            "success": True,
+            "segments": transcript,
+            "total_segments": len(transcript),
+        }
 
-                rms = math.sqrt(
-                    squared_total / len(samples)
-                )
+    finally:
+        source_path.unlink(missing_ok=True)
+        wav_path.unlink(missing_ok=True)
 
-                energies.append(rms)
 
-        # Find the loudest non-overlapping moments
-        clip_duration = min(15, max(3, int(duration / 3)))
-        max_clips = 20
+# ============================================================
+# STREAMER-FOCUSED HIGHLIGHT DETECTION
+# ============================================================
 
+@app.post("/api/clips/highlights-v2")
+async def generate_streamer_highlights(
+    file: UploadFile = File(...),
+    max_clips: int = Form(10),
+):
+    max_clips = max(1, min(max_clips, MAX_GENERATED_CLIPS))
+
+    source_path = await save_upload(file)
+    wav_path = TEMP_DIR / f"{uuid.uuid4().hex}.wav"
+
+    created_clips = []
+
+    # Phrases commonly associated with reactions or excitement.
+    streamer_phrases = [
+        "oh my god",
+        "no way",
+        "let's go",
+        "lets go",
+        "bro what",
+        "what just happened",
+        "that's crazy",
+        "thats crazy",
+        "are you serious",
+        "you are joking",
+        "i can't believe",
+        "i cannot believe",
+        "what the hell",
+        "what is happening",
+        "this is insane",
+        "that is insane",
+        "i'm dead",
+        "im dead",
+        "chat",
+        "look at this",
+        "listen",
+        "help me",
+        "get out of here",
+        "no no no",
+    ]
+
+    cue_words = {
+        "crazy",
+        "insane",
+        "screaming",
+        "scream",
+        "laughing",
+        "laugh",
+        "hilarious",
+        "wild",
+        "unbelievable",
+        "clutch",
+        "bruh",
+        "bro",
+        "lmao",
+        "wow",
+        "damn",
+        "wait",
+        "what",
+        "no",
+        "yes",
+        "finally",
+        "destroyed",
+        "amazing",
+        "ridiculous",
+        "legendary",
+        "craziest",
+    }
+
+    try:
+        duration = get_video_duration(source_path)
+
+        extract_audio_wav(
+            source_path,
+            wav_path,
+        )
+
+        transcript = transcribe_audio(wav_path)
+
+        energy = calculate_audio_energy(wav_path)
+
+        # Keep moments with their start/end times and scores.
         candidates = []
 
-        for start in range(
-            0,
-            max(1, len(energies) - clip_duration + 1)
-        ):
-            end = min(
-                start + clip_duration,
-                len(energies)
+        for segment in transcript:
+            text = segment["text"].lower()
+            tokens = set(
+                text.replace("!", " ")
+                .replace("?", " ")
+                .replace(".", " ")
+                .replace(",", " ")
+                .split()
             )
 
-            average_energy = sum(
-                energies[start:end]
-            ) / (end - start)
-
-            candidates.append({
-                "start_seconds": start,
-                "end_seconds": min(
-                    start + clip_duration,
-                    int(duration)
-                ),
-                "score": average_energy
-            })
-
-        candidates.sort(
-            key=lambda item: item["score"],
-            reverse=True
-        )
-
-        selected = []
-
-        for candidate in candidates:
-            overlaps = any(
-                candidate["start_seconds"] < item["end_seconds"]
-                and candidate["end_seconds"] > item["start_seconds"]
-                for item in selected
-            )
-
-            if not overlaps:
-                selected.append(candidate)
-
-            if len(selected) >= max_clips:
-                break
-
-        # Create clips from the selected moments
-        created_clips = []
-
-        for moment in selected:
-            clip_id = uuid.uuid4().hex
-            output_path = CLIPS_DIR / f"{clip_id}.mp4"
-
-            clip_command = [
-                get_ffmpeg(),
-                "-y",
-                "-ss", str(moment["start_seconds"]),
-                "-i", str(input_path),
-                "-t", str(
-                    moment["end_seconds"] - moment["start_seconds"]
-                ),
-                "-map", "0:v:0",
-                "-map", "0:a?",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-c:a", "aac",
-                "-movflags", "+faststart",
-                str(output_path)
-            ]
-
-            clip_result = subprocess.run(
-                clip_command,
-                capture_output=True,
-                text=True,
-                timeout=600,
-                check=False
-            )
-
-            if clip_result.returncode == 0 and output_path.exists():
-                created_clips.append({
-                    "clip_id": clip_id,
-                    "start_seconds": moment["start_seconds"],
-                    "end_seconds": moment["end_seconds"],
-                    "download_url": f"/api/clips/{clip_id}/download"
-                })
-
-        if not created_clips:
-            raise HTTPException(
-                status_code=422,
-                detail="No clips could be created from this video."
-            )
-
-        return {
-            "message": "Automatic highlight analysis completed.",
-            "method": "Audio intensity analysis",
-            "clips_created": len(created_clips),
-            "highlights": created_clips
-        }
-
-    except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=408,
-            detail="Video analysis took too long. Try a shorter video."
-        )
-
-    finally:
-        await video.close()
-        input_path.unlink(missing_ok=True)
-        audio_path.unlink(missing_ok=True)
-
-        # ClipStream AI V2: Speech Transcription
-@app.post("/api/clips/transcribe")
-async def transcribe_video(video: UploadFile = File(...)):
-    if not video.filename:
-        raise HTTPException(
-            status_code=400,
-            detail="Please choose a video file."
-        )
-
-    if not video.content_type or not video.content_type.startswith("video/"):
-        raise HTTPException(
-            status_code=400,
-            detail="Please upload a video file."
-        )
-
-    job_id = uuid.uuid4().hex
-
-    input_path = UPLOAD_DIR / f"{job_id}_source"
-    audio_path = UPLOAD_DIR / f"{job_id}_audio.wav"
-
-    total_bytes = 0
-
-    try:
-        # Save the uploaded video
-        with input_path.open("wb") as destination:
-            while True:
-                chunk = await video.read(1024 * 1024)
-
-                if not chunk:
-                    break
-
-                total_bytes += len(chunk)
-
-                if total_bytes > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail="Video exceeds the 500 MB upload limit."
-                    )
-
-                destination.write(chunk)
-
-        if total_bytes == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="The uploaded video is empty."
-            )
-
-        # Extract audio for speech recognition
-        command = [
-            get_ffmpeg(),
-            "-y",
-            "-i", str(input_path),
-            "-map", "0:a:0",
-            "-vn",
-            "-ac", "1",
-            "-ar", "16000",
-            "-c:a", "pcm_s16le",
-            str(audio_path)
-        ]
-
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False
-        )
-
-        if result.returncode != 0 or not audio_path.exists():
-            raise HTTPException(
-                status_code=422,
-                detail="Could not extract audio. Check that the video contains an audio track."
-            )
-
-        # Load the Whisper model and transcribe the audio
-        model = get_whisper_model()
-
-        segments, info = model.transcribe(
-            str(audio_path),
-            beam_size=5,
-            vad_filter=True
-        )
-
-        transcript_segments = []
-
-        for segment in segments:
-            transcript_segments.append({
-                "start_seconds": round(segment.start, 2),
-                "end_seconds": round(segment.end, 2),
-                "text": segment.text.strip()
-            })
-
-        full_transcript = " ".join(
-            segment["text"]
-            for segment in transcript_segments
-        )
-
-        return {
-            "message": "Speech transcription completed.",
-            "language": info.language,
-            "language_probability": round(
-                info.language_probability, 3
-            ),
-            "segments_detected": len(transcript_segments),
-            "transcript": full_transcript,
-            "segments": transcript_segments
-        }
-
-    except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=408,
-            detail="Audio extraction took too long. Try a shorter video."
-        )
-
-    finally:
-        await video.close()
-        input_path.unlink(missing_ok=True)
-        audio_path.unlink(missing_ok=True)
-
-        # ClipStream AI V2: Dialogue-Based Highlight Detection
-@app.post("/api/clips/highlights-v2")
-async def detect_highlights_v2(video: UploadFile = File(...)):
-    if not video.filename:
-        raise HTTPException(
-            status_code=400,
-            detail="Please choose a video file."
-        )
-
-    if not video.content_type or not video.content_type.startswith("video/"):
-        raise HTTPException(
-            status_code=400,
-            detail="Please upload a video file."
-        )
-
-    job_id = uuid.uuid4().hex
-
-    input_path = UPLOAD_DIR / f"{job_id}_source"
-    audio_path = UPLOAD_DIR / f"{job_id}_audio.wav"
-
-    total_bytes = 0
-    created_paths = []
-
-    try:
-        # Save the uploaded video
-        with input_path.open("wb") as destination:
-            while True:
-                chunk = await video.read(1024 * 1024)
-
-                if not chunk:
-                    break
-
-                total_bytes += len(chunk)
-
-                if total_bytes > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail="Video exceeds the 500 MB upload limit."
-                    )
-
-                destination.write(chunk)
-
-        if total_bytes == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="The uploaded video is empty."
-            )
-
-        # Extract audio for transcription
-        command = [
-            get_ffmpeg(),
-            "-y",
-            "-i", str(input_path),
-            "-map", "0:a:0",
-            "-vn",
-            "-ac", "1",
-            "-ar", "16000",
-            "-c:a", "pcm_s16le",
-            str(audio_path)
-        ]
-
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False
-        )
-
-        if result.returncode != 0 or not audio_path.exists():
-            raise HTTPException(
-                status_code=422,
-                detail="Could not extract audio. Make sure the video contains an audio track."
-            )
-
-        # Get the audio duration
-        with wave.open(str(audio_path), "rb") as audio:
-            sample_rate = audio.getframerate()
-            total_frames = audio.getnframes()
-
-            if sample_rate <= 0 or total_frames <= 0:
-                raise HTTPException(
-                    status_code=422,
-                    detail="The video contains no usable audio."
-                )
-
-            duration = total_frames / sample_rate
-
-        # Transcribe dialogue using Whisper
-        model = get_whisper_model()
-
-        whisper_segments, info = model.transcribe(
-            str(audio_path),
-            beam_size=5,
-            vad_filter=True
-        )
-
-        transcript_segments = []
-
-        for segment in whisper_segments:
-            text = segment.text.strip()
-
-            if text:
-                transcript_segments.append({
-                    "start": float(segment.start),
-                    "end": float(segment.end),
-                    "text": text
-                })
-
-        if not transcript_segments:
-            raise HTTPException(
-                status_code=422,
-                detail="No recognizable speech was found in this video."
-            )
-
-        # Phrases that may signal an important dramatic exchange
-        dramatic_phrases = [
-            "tell me the truth",
-            "you lied to me",
-            "how could you",
-            "what did you do",
-            "we need to talk",
-            "i love you",
-            "i hate you",
-            "i am sorry",
-            "i'm sorry",
-            "don't leave me",
-            "leave me alone",
-            "who are you",
-            "what happened",
-            "are you serious",
-            "i swear",
-            "i promise",
-            "it's over",
-            "it is over",
-            "the truth",
-            "you don't understand",
-            "you do not understand",
-            "i know what you did",
-            "i am pregnant",
-            "i'm pregnant",
-            "you killed"
-        ]
-
-        cue_words = {
-            "truth", "secret", "lied", "lie", "pregnant",
-            "divorce", "cheated", "betrayal", "revenge",
-            "arrest", "dead", "died", "killed", "sorry",
-            "hate", "promise", "forgive", "married",
-            "husband", "wife", "please", "never"
-        }
-                # Streamer-focused highlight detection
-        # Combines dialogue cues, audio intensity, and surrounding context.
-
-        streamer_phrases = [
-            "oh my god",
-            "no way",
-            "what just happened",
-            "are you serious",
-            "you've got to be kidding",
-            "you gotta be kidding",
-            "let's go",
-            "lets go",
-            "bro what",
-            "that's crazy",
-            "that is crazy",
-            "that's insane",
-            "that is insane",
-            "what the hell",
-            "what the fuck",
-            "i can't believe",
-            "i'm dead",
-            "im dead",
-            "that's wild",
-            "that was crazy",
-            "that was insane",
-            "you are crazy",
-            "he's cheating",
-            "she's cheating",
-            "we actually won",
-            "we actually lost",
-            "no no no",
-            "what are you doing",
-            "get out of here",
-            "shut up",
-            "come on",
-            "i swear",
-            "i did not expect that",
-        ]
-
-        streamer_words = {
-            "bro",
-            "bruh",
-            "chat",
-            "crazy",
-            "insane",
-            "wild",
-            "laughing",
-            "screaming",
-            "lmao",
-            "clutch",
-            "cheating",
-            "scared",
-            "jumped",
-            "surprise",
-            "surprised",
-            "wow",
-            "damn",
-            "no",
-            "help",
-            "run",
-            "win",
-            "won",
-            "lost",
-            "rage",
-            "bruh",
-            "unbelievable",
-        }
-
-        # Measure audio intensity in one-second intervals.
-        # The extracted WAV is mono, 16-bit PCM audio.
-        audio_energy = []
-
-        with wave.open(str(audio_path), "rb") as audio:
-            sample_rate = audio.getframerate()
-            sample_width = audio.getsampwidth()
-
-            if sample_width != 2:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Unsupported audio format for analysis."
-                )
-
-            while True:
-                raw_audio = audio.readframes(sample_rate)
-
-                if not raw_audio:
-                    break
-
-                sample_count = len(raw_audio) // 2
-
-                if sample_count == 0:
-                    continue
-
-                samples = struct.unpack(
-                    "<" + ("h" * sample_count),
-                    raw_audio[:sample_count * 2]
-                )
-
-                squared_total = sum(
-                    sample * sample for sample in samples
-                )
-
-                rms = math.sqrt(
-                    squared_total / sample_count
-                )
-
-                audio_energy.append(rms)
-
-        # Find relatively loud moments compared with the video's audio.
-        loud_seconds = []
-
-        if audio_energy:
-            ordered_energy = sorted(audio_energy)
-
-            percentile_index = min(
-                len(ordered_energy) - 1,
-                int(len(ordered_energy) * 0.85)
-            )
-
-            loudness_threshold = max(
-                700.0,
-                ordered_energy[percentile_index]
-            )
-
-            loud_seconds = [
-                second
-                for second, energy in enumerate(audio_energy)
-                if energy >= loudness_threshold and energy > 700
-            ]
-
-        loud_seconds_set = set(loud_seconds)
-
-        # Score transcript segments for possible streamer highlights.
-        seeds = []
-
-        for segment in transcript_segments:
-            text = segment["text"].strip()
-            lower_text = text.lower()
-
-            tokens = {
-                word.strip(".,!?;:\"'()[]{}")
-                for word in lower_text.split()
-            }
-
-            dramatic_phrase_hits = sum( 1
-                for phrase in dramatic_phrases
-                if phrase in lower_text
-            )
-            
-            streamer_phrase_hits = sum(
+            phrase_hits = sum(
                 1
                 for phrase in streamer_phrases
-                if phrase in lower_text
+                if phrase in text
             )
-            
-            phrase_hits = dramatic_phrase_hits + streamer_phrase_hits
-            
-        
-            word_hits = sum(          
+
+            word_hits = sum(
                 1
                 for word in tokens
-                    if word in cue_words or word in streamer_words
+                if word in cue_words
+            )
 
-             )
-        
-        
-
-        
-            
-   
+            # Reward expressive language and energetic phrases.
             score = (
-                phrase_hits * 2.2
-                + min(word_hits, 4) * 0.7
+                phrase_hits * 4.0
+                + word_hits * 1.5
             )
 
-            if "!" in text:
-                score += 0.5
-
-            if "?" in text:
-                score += 0.3
-
-            segment_start = max(
-                0, int(segment["start"]) - 1
-            )
-
-            segment_end = min(
-                len(audio_energy),
-                int(segment["end"]) + 2
-            )
-
-            has_loud_audio = any(
-                second in loud_seconds_set
-                for second in range(segment_start, segment_end)
-            )
-
-            if has_loud_audio:
-                score += 1.2
-
-            if score >= 1.5:
-                seeds.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "score": score,
-                })
-
-        # Audio peaks can also be candidates when a reaction contains
-        # little or no recognizable speech.
-        for second in loud_seconds:
-            seeds.append({
-                "start": float(second),
-                "end": min(duration, float(second + 1)),
-                "score": 1.8,
-            })
-
-        # Fallback: if no strong cues were found, consider longer
-        # spoken segments instead of returning nothing immediately.
-        if not seeds:
-            for segment in transcript_segments:
-                word_count = len(segment["text"].split())
-
-                if word_count >= 8:
-                    seeds.append({
-                        "start": segment["start"],
-                        "end": segment["end"],
-                        "score": 0.8,
-                    })
-
-        if not seeds:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "No suitable candidate moments were detected. "
-                    "Try a video with clearer speech or stronger reactions."
-                )
-            )
-
-        # Group nearby signals into possible events.
-        # Nearby signals may belong to the same joke, reaction, or exchange.
-        seeds.sort(key=lambda item: item["start"])
-
-        event_groups = []
-
-        for seed in seeds:
-            start_new_group = (
-                not event_groups
-                or seed["start"] - event_groups[-1]["end"] > 12
-                or seed["start"] - event_groups[-1]["start"] > 65
-            )
-
-            if start_new_group:
-                event_groups.append({
-                    "start": seed["start"],
-                    "end": seed["end"],
-                    "score": seed["score"],
-                })
-            else:
-                group = event_groups[-1]
-
-                group["end"] = max(
-                    group["end"],
-                    seed["end"]
-                )
-
-                group["score"] += seed["score"]
-
-        # Choose adaptive boundaries.
-        # Short reactions stay short; longer sequences receive more context.
-        MIN_CLIP_SECONDS = min(10.0, duration)
-        MAX_CLIP_SECONDS = min(90.0, duration)
-
-        candidates = []
-
-        for group in event_groups:
-            # Include context before and after the main event.
-            start = max(
-                0.0,
-                group["start"] - 6.0
-            )
-
-            end = min(
-                duration,
-                group["end"] + 8.0
-            )
-
-            # Ensure the clip isn't unnecessarily short.
-            if end - start < MIN_CLIP_SECONDS:
-                missing_time = MIN_CLIP_SECONDS - (end - start)
-
-                start = max(
-                    0.0,
-                    start - missing_time / 2
-                )
-
-                end = min(
-                    duration,
-                    end + missing_time / 2
-                )
-
-            # Never exceed the maximum duration.
-            if end - start > MAX_CLIP_SECONDS:
-                center = (start + end) / 2
-
-                start = max(
-                    0.0,
-                    center - MAX_CLIP_SECONDS / 2
-                )
-
-                end = min(
-                    duration,
-                    start + MAX_CLIP_SECONDS
-                )
-
-                # Adjust the start if the video ends before the
-                # full permitted duration has been reached.
-                start = max(
-                    0.0,
-                    end - MAX_CLIP_SECONDS
-                )
-
-            if end <= start:
+            # Skip ordinary transcript segments with no cue hits.
+            if score <= 0:
                 continue
 
-            # Include the dialogue from the selected interval.
-            window_segments = [
-                segment
-                for segment in transcript_segments
-                if segment["start"] < end
-                and segment["end"] > start
+            start = max(0.0, segment["start"] - 8.0)
+            end = min(duration, segment["end"] + 10.0)
+
+            if end - start < 5:
+                continue
+
+            # Add an audio-energy bonus for energetic moments.
+            nearby_energy = [
+                rms
+                for second, rms in energy
+                if start <= second <= end
             ]
 
-            transcript_excerpt = " ".join(
-                segment["text"]
-                for segment in window_segments
-            ).strip()
+            if nearby_energy:
+                score += (
+                    sum(nearby_energy) / len(nearby_energy)
+                ) / 5000.0
 
-            # Give more context-rich candidates a small ranking bonus.
-            excerpt_word_count = len(
-                transcript_excerpt.split()
+            candidates.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "score": score,
+                    "transcript": segment["text"],
+                }
             )
 
-            ranking_score = (
-                group["score"]
-                + min(excerpt_word_count / 50, 2.0)
-            )
+        # If dialogue cues are unavailable, use audio peaks.
+        if not candidates:
+            for start, end, score in choose_loud_windows(
+                energy,
+                duration,
+                max_clips=max_clips,
+                clip_length=30,
+            ):
+                candidates.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "score": score,
+                        "transcript": "",
+                    }
+                )
 
-            candidates.append({
-                "start_seconds": round(start, 2),
-                "end_seconds": round(end, 2),
-                "score": round(ranking_score, 2),
-                "transcript_excerpt": transcript_excerpt[:400],
-            })
-
-        # Rank the candidates and avoid duplicate or overlapping clips.
         candidates.sort(
-            key=lambda item: item["score"],
-            reverse=True
+            key=lambda candidate: candidate["score"],
+            reverse=True,
         )
 
-        max_clips = 10
         selected = []
 
         for candidate in candidates:
             overlaps = any(
-                candidate["start_seconds"] < item["end_seconds"]
-                and candidate["end_seconds"] > item["start_seconds"]
-                for item in selected
+                not (
+                    candidate["end"] <= existing["start"]
+                    or candidate["start"] >= existing["end"]
+                )
+                for existing in selected
             )
 
-            if not overlaps:
-                selected.append(candidate)
+            if overlaps:
+                continue
+
+            selected.append(candidate)
 
             if len(selected) >= max_clips:
                 break
 
-        if not selected:
-            raise HTTPException(
-                status_code=422,
-                detail="No usable highlight clips could be selected."
-            )
+        selected.sort(key=lambda candidate: candidate["start"])
 
-        # Create the selected clips with FFmpeg
-        created_clips = []
+        for candidate in selected:
+            try:
+                clip_id, output_path = create_clip(
+                    source_path,
+                    candidate["start"],
+                    candidate["end"],
+                )
 
-        for moment in selected:
-            clip_id = uuid.uuid4().hex
-            output_path = CLIPS_DIR / f"{clip_id}.mp4"
+                created_clips.append(
+                    {
+                        "clip_id": clip_id,
+                        "start": round(candidate["start"], 2),
+                        "end": round(candidate["end"], 2),
+                        "duration": round(
+                            candidate["end"] - candidate["start"],
+                            2,
+                        ),
+                        "score": round(candidate["score"], 2),
+                        "transcript": candidate["transcript"],
+                        "download_url": (
+                            f"/api/clips/{clip_id}/download"
+                        ),
+                        "preview_url": (
+                            f"/api/clips/{clip_id}/preview"
+                        ),
+                    }
+                )
 
-            clip_command = [
-                get_ffmpeg(),
-                "-y",
-                "-ss", str(moment["start_seconds"]),
-                "-i", str(input_path),
-                "-t", str(
-                    moment["end_seconds"] - moment["start_seconds"]
-                ),
-                "-map", "0:v:0",
-                "-map", "0:a?",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-c:a", "aac",
-                "-movflags", "+faststart",
-                str(output_path)
-            ]
-
-            clip_result = subprocess.run(
-                clip_command,
-                capture_output=True,
-                text=True,
-                timeout=600,
-                check=False
-            )
-
-            if clip_result.returncode == 0 and output_path.is_file():
-                created_paths.append(output_path)
-
-                created_clips.append({
-                    "clip_id": clip_id,
-                    "start_seconds": moment["start_seconds"],
-                    "end_seconds": moment["end_seconds"],
-                    "ranking_score": moment["score"],
-                    "transcript_excerpt": moment["transcript_excerpt"],
-                    "download_url": f"/api/clips/{clip_id}/download"
-                })
-
-            else:
-                output_path.unlink(missing_ok=True)
-
-        if not created_clips:
-            raise HTTPException(
-                status_code=422,
-                detail="No candidate clips could be generated."
-            )
-
-        # Display clips in chronological order
-        created_clips.sort(
-            key=lambda clip: clip["start_seconds"]
-        )
+            except HTTPException as exc:
+                print(
+                    "Could not create streamer highlight: "
+                    f"{exc.detail}"
+                )
 
         return {
-            "message": "Dialogue-based highlight analysis completed.",
-            "analysis_method": "Whisper transcription and dialogue-cue ranking",
-            "detected_language": info.language,
-            "clips_created": len(created_clips),
-            "highlights": created_clips
+            "success": True,
+            "method": "streamer_dialogue_and_audio",
+            "total_clips": len(created_clips),
+            "clips": created_clips,
+            "note": (
+                "These are candidate highlights based on "
+                "transcript cues and audio energy. They still "
+                "need testing against real streamer videos."
+            ),
         }
 
-    except subprocess.TimeoutExpired:
-        for path in created_paths:
-            path.unlink(missing_ok=True)
-
-        raise HTTPException(
-            status_code=408,
-            detail="Processing took too long. Try a shorter video."
-        )
-
     finally:
-        await video.close()
-        input_path.unlink(missing_ok=True)
-        audio_path.unlink(missing_ok=True)
+        source_path.unlink(missing_ok=True)
+        wav_path.unlink(missing_ok=True)
 
-        # List real clips generated by ClipStream AI
+
+# ============================================================
+# LIST GENERATED CLIPS
+# ============================================================
+
 @app.get("/api/clips")
 def list_clips():
-    generated_clips = []
+    clips = []
 
-    for clip_path in CLIPS_DIR.glob("*.mp4"):
-        if not clip_path.is_file():
-            continue
+    for path in sorted(
+        CLIPS_DIR.glob("*.mp4"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    ):
+        clip_id = path.stem
 
-        file_info = clip_path.stat()
-        clip_id = clip_path.stem
-
-        generated_clips.append({
-            "clip_id": clip_id,
-            "title": f"Generated Clip {clip_id[:8]}",
-            "created_at": datetime.fromtimestamp(
-                file_info.st_mtime,
-                timezone.utc
-            ).isoformat(),
-            "size_bytes": file_info.st_size,
-            "download_url": f"/api/clips/{clip_id}/download",
-            "preview_url": f"/api/clips/{clip_id}/preview"
-        })
-
-    generated_clips.sort(
-        key=lambda clip: clip["created_at"],
-        reverse=True
-    )
+        clips.append(
+            {
+                "clip_id": clip_id,
+                "filename": path.name,
+                "file_size": path.stat().st_size,
+                "created_at": datetime.fromtimestamp(
+                    path.stat().st_mtime,
+                    tz=timezone.utc,
+                ).isoformat(),
+                "download_url": (
+                    f"/api/clips/{clip_id}/download"
+                ),
+                "preview_url": (
+                    f"/api/clips/{clip_id}/preview"
+                ),
+            }
+        )
 
     return {
-        "count": len(generated_clips),
-        "clips": generated_clips
+        "success": True,
+        "total_clips": len(clips),
+        "clips": clips,
     }
 
 
-# Preview a generated video in the browser
-@app.get("/api/clips/{clip_id}/preview")
-def preview_clip(clip_id: str):
-    if not clip_id.isalnum():
+# ============================================================
+# CLIP FORMAT AND CAPTION EXPORT
+# ============================================================
+
+@app.post("/api/clips/{clip_id}/format")
+def format_clip(
+    clip_id: str,
+    aspect_ratio: str = Form(...),
+    caption: str = Form(""),
+):
+    """
+    Export an existing clip in portrait, landscape or square format.
+
+    Supported aspect ratios:
+        9:16 — portrait
+        16:9 — landscape
+        1:1  — square
+    """
+
+    source_path = safe_clip_path(clip_id)
+
+    # IMPORTANT:
+    # This dictionary must remain OUTSIDE the file-existence check.
+    # Otherwise, valid clips will trigger an UnboundLocalError.
+    format_filters = {
+        "9:16": (
+            "scale=1080:1920:"
+            "force_original_aspect_ratio=increase,"
+            "crop=1080:1920"
+        ),
+        "16:9": (
+            "scale=1920:1080:"
+            "force_original_aspect_ratio=increase,"
+            "crop=1920:1080"
+        ),
+        "1:1": (
+            "scale=1080:1080:"
+            "force_original_aspect_ratio=increase,"
+            "crop=1080:1080"
+        ),
+    }
+
+    if aspect_ratio not in format_filters:
         raise HTTPException(
             status_code=400,
-            detail="Invalid clip ID."
+            detail=(
+                "Unsupported aspect ratio. Choose 9:16, 16:9 or 1:1."
+            ),
         )
 
-    clip_path = CLIPS_DIR / f"{clip_id}.mp4"
+    output_id = uuid.uuid4().hex
+    output_path = CLIPS_DIR / f"{output_id}.mp4"
 
-    if not clip_path.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="Clip not found."
+    video_filter = format_filters[aspect_ratio]
+    caption_file = None
+
+    try:
+        cleaned_caption = caption.strip()
+
+        if cleaned_caption:
+            # Using a text file avoids many FFmpeg quoting issues
+            # caused by punctuation in captions.
+            caption_file = (
+                TEMP_DIR / f"{uuid.uuid4().hex}.txt"
+            )
+
+            caption_file.write_text(
+                cleaned_caption,
+                encoding="utf-8",
+            )
+
+            # FFmpeg filter paths need escaping for special characters.
+            caption_path = caption_file.resolve().as_posix()
+            caption_path = caption_path.replace("\\", "/")
+            caption_path = caption_path.replace(":", r"\:")
+            caption_path = caption_path.replace("'", r"\'")
+
+            font_path = Path("C:/Windows/Fonts/arial.ttf")
+
+            if font_path.is_file():
+                escaped_font = font_path.as_posix()
+                escaped_font = escaped_font.replace(":", r"\:")
+
+                font_option = (
+                    f"fontfile='{escaped_font}':"
+                )
+            else:
+                font_option = ""
+
+            video_filter += (
+                f",drawtext={font_option}"
+                f"textfile='{caption_path}':"
+                "fontcolor=white:"
+                "fontsize=48:"
+                "borderw=3:"
+                "bordercolor=black:"
+                "box=1:"
+                "boxcolor=black@0.45:"
+                "boxborderw=12:"
+                "x=(w-text_w)/2:"
+                "y=h-text_h-80"
+            )
+
+        run_ffmpeg(
+            [
+                "-i",
+                str(source_path),
+                "-vf",
+                video_filter,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ],
+            timeout=900,
         )
+
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise HTTPException(
+                status_code=422,
+                detail="The formatted clip could not be exported.",
+            )
+
+        return {
+            "success": True,
+            "original_clip_id": clip_id,
+            "clip_id": output_id,
+            "aspect_ratio": aspect_ratio,
+            "caption_added": bool(cleaned_caption),
+            "file_size": output_path.stat().st_size,
+            "download_url": (
+                f"/api/clips/{output_id}/download"
+            ),
+            "preview_url": (
+                f"/api/clips/{output_id}/preview"
+            ),
+        }
+
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
+
+    finally:
+        if caption_file:
+            caption_file.unlink(missing_ok=True)
+
+
+# ============================================================
+# CLIP PREVIEW AND DOWNLOAD
+# ============================================================
+
+@app.get("/api/clips/{clip_id}/preview")
+def preview_clip(clip_id: str):
+    path = safe_clip_path(clip_id)
 
     return FileResponse(
-        path=clip_path,
-        media_type="video/mp4"
+        path=path,
+        media_type="video/mp4",
+        filename=path.name,
     )
+
 
 @app.get("/api/clips/{clip_id}/download")
 def download_clip(clip_id: str):
-    if not clip_id.isalnum():
-        raise HTTPException(status_code=400, detail="Invalid clip ID.")
-
-    clip_path = CLIPS_DIR / f"{clip_id}.mp4"
-
-    if not clip_path.is_file():
-        raise HTTPException(status_code=404, detail="Clip not found.")
+    path = safe_clip_path(clip_id)
 
     return FileResponse(
-        path=clip_path,
+        path=path,
         media_type="video/mp4",
-        filename=f"clip_{clip_id}.mp4",
+        filename=path.name,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{path.name}"'
+            ),
+        },
     )
